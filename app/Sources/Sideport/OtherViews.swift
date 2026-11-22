@@ -5,6 +5,7 @@ import SwiftUI
 struct DevicesView: View {
     @EnvironmentObject var store: Store
     @State private var loading = false
+    @State private var enablingWifi: String?
 
     var body: some View {
         ScrollView {
@@ -14,7 +15,7 @@ struct DevicesView: View {
                     VStack(spacing: 10) {
                         Image(systemName: "cable.connector").font(.system(size: 40, weight: .light)).foregroundStyle(.secondary)
                         Text("No devices connected").font(.title3.weight(.semibold))
-                        Text("Plug your iPhone in with a cable and tap Trust. To use Wi-Fi after that, open it in Finder and turn on \"Show this iPhone when on Wi-Fi\".")
+                        Text("Plug your iPhone in with a cable and tap Trust. Then press Turn On Wi-Fi here, and after that it works without the cable whenever it's on the same network.")
                             .foregroundStyle(.secondary).multilineTextAlignment(.center).frame(maxWidth: 420)
                     }
                     .frame(maxWidth: .infinity).padding(40).card()
@@ -29,9 +30,10 @@ struct DevicesView: View {
                                 Text(d.udid).font(.system(size: 10.5, design: .monospaced)).foregroundStyle(.tertiary).textSelection(.enabled)
                             }
                             Spacer()
-                            Pill(text: d.wifi ? "Wi-Fi" : "USB", symbol: d.wifi ? "wifi" : "cable.connector", color: d.wifi ? .blue : .green)
+                            Pill(text: d.connectionLabel, symbol: d.wifi ? "wifi" : "cable.connector", color: d.wifi ? .blue : .green)
                             Button("Apps on This Device") { Task { loading = true; await store.loadDeviceApps(d.udid); loading = false } }
                         }
+                        wifiRow(d)
                         if let apps = store.deviceApps[d.udid] {
                             Divider()
                             Text("\(apps.count) apps installed. The ones Sideport signed are marked.").font(.system(size: 11.5)).foregroundStyle(.secondary)
@@ -59,6 +61,39 @@ struct DevicesView: View {
             }
             .padding(26)
         }
+    }
+
+    /// Wi-Fi state for one phone: a button to turn it on while plugged in, and what Sideport can do without the cable.
+    @ViewBuilder private func wifiRow(_ d: DeviceInfo) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "wifi").foregroundStyle(.secondary)
+            switch (d.connection, d.wifiEnabled) {
+            case ("usb", .some(true)):
+                Text(d.paired ? "Wi-Fi is on. You can unplug it: Sideport will find it on the same network." : "Wi-Fi is on.")
+            case ("usb", _):
+                Text("Turn on Wi-Fi to install and refresh without the cable.")
+                Button(enablingWifi == d.udid ? "Turning On…" : "Turn On Wi-Fi") {
+                    Task {
+                        enablingWifi = d.udid
+                        await store.enableWifi(d.udid)
+                        enablingWifi = nil
+                    }
+                }
+                .disabled(enablingWifi != nil)
+            case ("network", _):
+                Text("macOS doesn't see this phone right now, so Sideport is connecting to it directly over Wi-Fi.")
+            default:
+                Text("Connected over Wi-Fi.")
+            }
+            Spacer()
+            if d.paired {
+                Button("Forget Pairing") { Task { await store.forgetPairing(d.udid) } }
+                    .buttonStyle(.borderless)
+                    .help("Delete the pairing Sideport saved, so it stops connecting to this phone directly over Wi-Fi")
+            }
+        }
+        .font(.system(size: 11.5))
+        .foregroundStyle(.secondary)
     }
 }
 

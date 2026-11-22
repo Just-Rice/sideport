@@ -7,6 +7,7 @@
 // Requests run concurrently. The Apple ID login, signing and device code come from Impactor
 // (https://github.com/claration/Impactor, MIT/MPL-2.0).
 
+mod direct;
 mod ipa;
 mod ops;
 

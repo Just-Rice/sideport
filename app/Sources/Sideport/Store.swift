@@ -219,6 +219,33 @@ final class Store: ObservableObject {
         }
     }
 
+    /// Turns on "Show this iPhone when on Wi-Fi" for a phone plugged in by USB, and keeps its pairing, so it can
+    /// be refreshed without the cable from then on.
+    func enableWifi(_ udid: String) async {
+        let name = devices.first { $0.udid == udid }?.name ?? "the phone"
+        do {
+            try await engine.call("enable_wifi", ["udid": udid])
+            log("Turned on Wi-Fi", "for \(name)", ok: true)
+            showToast("Wi-Fi is on. You can unplug \(name) now.")
+            await reloadDevices()
+        } catch {
+            showToast(error.localizedDescription)
+        }
+    }
+
+    /// Deletes the pairing Sideport saved for a phone, so it's no longer reached directly over Wi-Fi.
+    func forgetPairing(_ udid: String) async {
+        let name = devices.first { $0.udid == udid }?.name ?? "the phone"
+        do {
+            try await engine.call("forget_pairing", ["udid": udid])
+            log("Forgot the pairing", "for \(name)", ok: true)
+            showToast("Sideport will only reach \(name) through macOS now.")
+            await reloadDevices()
+        } catch {
+            showToast(error.localizedDescription)
+        }
+    }
+
     func uninstall(bundleId: String, from udid: String) async {
         do {
             try await engine.call("uninstall", ["udid": udid, "bundle_id": bundleId])
@@ -433,7 +460,7 @@ final class Store: ObservableObject {
         if !exportOnly {
             let udid = app.deviceUDID.flatMap { u in devices.contains { $0.udid == u } ? u : nil } ?? selectedDevice?.udid
             guard let udid else {
-                fail(&app, "No device connected. Plug in your iPhone (or turn on Wi-Fi syncing in Finder).")
+                fail(&app, "No device connected. Plug in your iPhone, or turn on its Wi-Fi in Devices and keep it on the same network.")
                 return
             }
             args["udid"] = udid

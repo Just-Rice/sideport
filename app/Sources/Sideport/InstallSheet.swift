@@ -113,10 +113,18 @@ struct InstallSheet: View {
                     Text("or drop an image on the preview").font(.system(size: 11)).foregroundStyle(.secondary)
                 }
             }
-            field("Bundle ID", text: o.bundleId, placeholder: draft.app.installedBundleId ?? "\(draft.info.bundleId).<team>",
+            field("Bundle ID", text: o.bundleId, placeholder: draft.app.installedBundleId ?? (draft.app.options.autoBundleId ? "\(draft.info.bundleId).<team>" : draft.info.bundleId),
                   note: draft.app.installedBundleId != nil
                     ? "Leave empty to keep \(draft.app.installedBundleId!), so refreshing keeps the app's data."
-                    : "Leave empty for the usual ID with your team added. Change it to install a second copy.")
+                    : draft.app.options.autoBundleId
+                        ? "Leave empty for the usual ID with your team added. Change it to install a second copy."
+                        : "Leave empty to keep the app's own ID. Change it to install a second copy.")
+            Toggle(isOn: o.autoBundleId) {
+                SectionTitle(title: "Automatic bundle ID", subtitle: draft.app.options.autoBundleId
+                    ? "Adds your team ID to the app's ID, so it never clashes with the App Store copy."
+                    : "Keeps \(draft.info.bundleId) as it is. Free Apple IDs can't use an ID that's already registered, like the App Store app's own.")
+            }
+            .disabled(!draft.app.options.bundleId.isEmpty || draft.app.installedBundleId != nil)
             field("Version", text: o.version, placeholder: draft.info.version)
             Toggle(isOn: draft.info.fileSharing ? .constant(true) : o.fileSharing) {
                 SectionTitle(title: "Show in the Files app", subtitle: draft.info.fileSharing ? "This app already shows its documents in Files." : "Lets you reach the app's documents (saves, mods) from Files.")
@@ -162,7 +170,29 @@ struct InstallSheet: View {
             Button("Add Tweaks…") {
                 o.tweaks.wrappedValue += pickFiles(types: ["deb", "dylib", "framework", "bundle"], multiple: true).map(\.path)
             }
-            toggle(o.elleKit, "Inject ElleKit", "The tweak loader. Added automatically when there are tweaks.")
+            Picker("Tweak loader", selection: o.tweakLoader) {
+                ForEach(TweakLoader.allCases) { Text($0.label).tag($0) }
+            }
+            switch draft.app.options.tweakLoader {
+            case .elleKit:
+                toggle(o.elleKit, "Add ElleKit even without tweaks", "It's added automatically when there are tweaks.")
+            case .substrate:
+                HStack {
+                    Button("Choose CydiaSubstrate.framework…") {
+                        if let url = pickFiles(types: [], directories: true, message: "Choose your CydiaSubstrate.framework").first {
+                            o.substratePath.wrappedValue = url.path
+                        }
+                    }
+                    Text(draft.app.options.substratePath.isEmpty ? "None chosen" : (draft.app.options.substratePath as NSString).lastPathComponent)
+                        .font(.system(size: 11)).foregroundStyle(draft.app.options.substratePath.isEmpty ? .orange : .secondary)
+                }
+                Text("Sideport doesn't include Cydia Substrate, so use your own copy (from a jailbreak's Library/Frameworks, for example). It goes in as Frameworks/CydiaSubstrate.framework.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+                toggle(o.elleKit, "Add it even without tweaks", "It's added automatically when there are tweaks.")
+            case .none:
+                Text("Tweaks go in as they are, with no hooking library added. For tweaks that bring their own.")
+                    .font(.system(size: 11)).foregroundStyle(.secondary)
+            }
             Divider()
             SectionTitle(title: "Replace files inside the app", subtitle: "e.g. swap a config or asset. The path is inside the .app.")
             ForEach(Array(draft.app.options.replaceFiles.keys.sorted()), id: \.self) { key in
@@ -204,11 +234,23 @@ struct InstallSheet: View {
                 Text("Signs without a certificate. Only works on jailbroken phones or with TrollStore.").font(.system(size: 11)).foregroundStyle(.secondary)
             }
             Divider()
+            switch draft.app.signing {
+            case .appleID:
+                Toggle(isOn: .constant(true)) {
+                    SectionTitle(title: "Allow debugging (JIT)", subtitle: "Always on with an Apple ID: its development profile includes get-task-allow, which emulators like Dolphin, UTM and PPSSPP need for JIT.")
+                }
+                .disabled(true)
+            case .certificate:
+                SectionTitle(title: "Debugging (JIT)", subtitle: "Comes from your provisioning profile: development profiles allow it, distribution and ad-hoc ones don't.")
+            case .adhoc:
+                toggle(o.enableDebugging, "Allow debugging (JIT)", "Adds get-task-allow, so debuggers can attach and emulators can use JIT.")
+            }
+            Divider()
             Picker("Install on", selection: Binding(get: { draft.app.deviceUDID ?? store.selectedDevice?.udid ?? "" }, set: { u in
                 draft.app.deviceUDID = u
                 draft.app.deviceName = store.devices.first { $0.udid == u }?.name
             })) {
-                ForEach(store.devices) { Text("\($0.name) (\($0.wifi ? "Wi-Fi" : "USB"))").tag($0.udid) }
+                ForEach(store.devices) { Text("\($0.name) (\($0.connectionLabel))").tag($0.udid) }
                 if let u = draft.app.deviceUDID, !store.devices.contains(where: { $0.udid == u }) {
                     Text("\(draft.app.deviceName ?? "Saved device") (not connected)").tag(u)
                 }

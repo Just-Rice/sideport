@@ -110,13 +110,13 @@ struct DeviceChip: View {
     var body: some View {
         Menu {
             if store.devices.isEmpty {
-                Text("No devices. Plug in your iPhone, or turn on Wi-Fi syncing in Finder.")
+                Text("No devices. Plug in your iPhone. To use it without the cable after that, turn on Wi-Fi in Devices.")
             }
             ForEach(store.devices) { d in
                 Button {
                     store.selectedDeviceUDID = d.udid
                 } label: {
-                    Label("\(d.name) · iOS \(d.ios) · \(d.wifi ? "Wi-Fi" : "USB")", systemImage: d.udid == store.selectedDevice?.udid ? "checkmark" : d.symbol)
+                    Label("\(d.name) · iOS \(d.ios) · \(d.connectionLabel)", systemImage: d.udid == store.selectedDevice?.udid ? "checkmark" : d.symbol)
                 }
             }
         } label: {
@@ -125,7 +125,7 @@ struct DeviceChip: View {
                     .font(.system(size: 15))
                 VStack(alignment: .leading, spacing: 0) {
                     Text(store.selectedDevice?.name ?? "No device").font(.system(size: 12, weight: .semibold))
-                    Text(store.selectedDevice.map { "iOS \($0.ios) · \($0.wifi ? "Wi-Fi" : "USB")" } ?? "Plug in your iPhone")
+                    Text(store.selectedDevice.map { "iOS \($0.ios) · \($0.connectionLabel)" } ?? "Plug in your iPhone")
                         .font(.system(size: 10.5)).foregroundStyle(.secondary)
                 }
                 Circle().fill(store.selectedDevice == nil ? Color.red : Color.green).frame(width: 7, height: 7)

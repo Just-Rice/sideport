@@ -17,9 +17,17 @@ struct AppOptions: Codable, Equatable {
     var removeURLSchemes = false
     var removeExtensions = false
     var removeWatch = false
+    /// Add the tweak loader even when there are no tweaks (named for ElleKit, the only loader there used to be).
     var elleKit = false
+    var tweakLoader: TweakLoader = .elleKit
+    /// Your own CydiaSubstrate.framework, for `tweakLoader == .substrate`.
+    var substratePath = ""
     var tweaks: [String] = []
     var replaceFiles: [String: String] = [:]
+    /// Add your team ID to the bundle ID (Sideloadly's "automatic bundle ID"). Off keeps the app's own ID.
+    var autoBundleId = true
+    /// Add get-task-allow, for debugging and JIT. Apple ID signing always has it; this matters for ad-hoc.
+    var enableDebugging = false
 
     var engineJSON: [String: Any] {
         var o: [String: Any] = [
@@ -27,13 +35,15 @@ struct AppOptions: Codable, Equatable {
             "ipad_fullscreen": iPadFullscreen, "game_mode": gameMode, "pro_motion": proMotion,
             "liquid_glass": liquidGlass, "remove_url_schemes": removeURLSchemes,
             "remove_extensions": removeExtensions, "remove_watch": removeWatch, "ellekit": elleKit,
-            "tweaks": tweaks, "replace_files": replaceFiles,
+            "tweak_framework": tweakLoader.rawValue, "tweaks": tweaks, "replace_files": replaceFiles,
+            "auto_bundle_id": autoBundleId, "debugging": enableDebugging,
         ]
         if !name.isEmpty { o["name"] = name }
         if !bundleId.isEmpty { o["bundle_id"] = bundleId }
         if !version.isEmpty { o["version"] = version }
         if !iconPath.isEmpty { o["icon"] = iconPath }
         if !minOS.isEmpty { o["min_os"] = minOS }
+        if !substratePath.isEmpty { o["substrate_path"] = substratePath }
         return o
     }
 
@@ -48,7 +58,65 @@ struct AppOptions: Codable, Equatable {
         if proMotion { s.append("120 Hz") }
         if gameMode { s.append("Game Mode") }
         if !tweaks.isEmpty { s.append("\(tweaks.count) tweak\(tweaks.count == 1 ? "" : "s")") }
+        if !tweaks.isEmpty && tweakLoader != .elleKit { s.append(tweakLoader.shortLabel) }
+        if !autoBundleId && bundleId.isEmpty { s.append("Original bundle ID") }
+        if enableDebugging { s.append("Debugging") }
         return s
+    }
+}
+
+extension AppOptions {
+    /// Reads every field as optional, so a library saved by an older Sideport (before an option existed) still
+    /// loads with that option's default, instead of failing to decode and coming back empty.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        func get<T: Decodable>(_ key: CodingKeys, _ fallback: T) -> T {
+            (try? c.decodeIfPresent(T.self, forKey: key)) ?? fallback
+        }
+        let d = AppOptions()
+        self.init()
+        name = get(.name, d.name)
+        bundleId = get(.bundleId, d.bundleId)
+        version = get(.version, d.version)
+        iconPath = get(.iconPath, d.iconPath)
+        minOS = get(.minOS, d.minOS)
+        removeDeviceLimits = get(.removeDeviceLimits, d.removeDeviceLimits)
+        lowerMinOS = get(.lowerMinOS, d.lowerMinOS)
+        fileSharing = get(.fileSharing, d.fileSharing)
+        iPadFullscreen = get(.iPadFullscreen, d.iPadFullscreen)
+        gameMode = get(.gameMode, d.gameMode)
+        proMotion = get(.proMotion, d.proMotion)
+        liquidGlass = get(.liquidGlass, d.liquidGlass)
+        removeURLSchemes = get(.removeURLSchemes, d.removeURLSchemes)
+        removeExtensions = get(.removeExtensions, d.removeExtensions)
+        removeWatch = get(.removeWatch, d.removeWatch)
+        elleKit = get(.elleKit, d.elleKit)
+        tweakLoader = get(.tweakLoader, d.tweakLoader)
+        substratePath = get(.substratePath, d.substratePath)
+        tweaks = get(.tweaks, d.tweaks)
+        replaceFiles = get(.replaceFiles, d.replaceFiles)
+        autoBundleId = get(.autoBundleId, d.autoBundleId)
+        enableDebugging = get(.enableDebugging, d.enableDebugging)
+    }
+}
+
+/// What makes injected tweaks work.
+enum TweakLoader: String, Codable, CaseIterable, Identifiable {
+    case elleKit = "ellekit", substrate, none
+    var id: String { rawValue }
+    var label: String {
+        switch self {
+        case .elleKit: return "ElleKit (built in)"
+        case .substrate: return "Cydia Substrate (your own copy)"
+        case .none: return "None"
+        }
+    }
+    var shortLabel: String {
+        switch self {
+        case .elleKit: return "ElleKit"
+        case .substrate: return "Substrate"
+        case .none: return "No loader"
+        }
     }
 }
 
@@ -154,14 +222,30 @@ struct DeviceInfo: Identifiable, Equatable, Hashable {
     var name: String
     var model: String
     var ios: String
-    var wifi: Bool
+    /// "usb", "wifi" (seen by macOS over Wi-Fi) or "network" (Sideport reached it directly with its saved pairing).
+    var connection: String
+    /// "Show this iPhone when on Wi-Fi" is on. Only known while it's plugged in by USB.
+    var wifiEnabled: Bool?
+    /// Sideport has saved its pairing, so it can reach the phone over Wi-Fi even when macOS doesn't list it.
+    var paired: Bool
 
     init(_ d: [String: Any]) {
         udid = d["udid"] as? String ?? ""
         name = d["name"] as? String ?? "iPhone"
         model = d["model"] as? String ?? ""
         ios = d["ios"] as? String ?? ""
-        wifi = (d["connection"] as? String) == "wifi"
+        connection = d["connection"] as? String ?? "usb"
+        wifiEnabled = d["wifi_enabled"] as? Bool
+        paired = d["paired"] as? Bool ?? false
+    }
+
+    var wifi: Bool { connection != "usb" }
+    var connectionLabel: String {
+        switch connection {
+        case "usb": return "USB"
+        case "network": return "Wi-Fi (direct)"
+        default: return "Wi-Fi"
+        }
     }
 
     var symbol: String { model.hasPrefix("iPad") ? "ipad" : model.hasPrefix("AppleTV") ? "appletv" : "iphone" }

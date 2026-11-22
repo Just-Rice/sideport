@@ -1,6 +1,7 @@
 // The engine's commands. Each takes the request's JSON and returns the result's JSON.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::time::Duration;
@@ -9,15 +10,17 @@ use anyhow::{Context, Result, anyhow, bail};
 use idevice::IdeviceService;
 use idevice::installation_proxy::InstallationProxyClient;
 use idevice::lockdown::LockdownClient;
+use idevice::pairing_file::PairingFile;
+use idevice::provider::IdeviceProvider;
 use idevice::usbmuxd::{Connection, UsbmuxdAddr, UsbmuxdConnection, UsbmuxdDevice};
 use plume_core::auth::{Account, TwoFactorAction, TwoFactorMethod, TwoFactorRequest};
 use plume_core::developer::DeveloperSession;
-use plume_core::{AnisetteConfiguration, CertificateIdentity};
+use plume_core::{AnisetteConfiguration, CertificateIdentity, SettingsScope, SigningSettings, UnifiedSigner};
 use plume_store::AccountStore;
-use plume_utils::{Device, Package, Signer, SignerFeatures, SignerInstallMode, SignerMode, SignerOptions};
+use plume_utils::{Bundle, Package, PlistInfoTrait, Signer, SignerFeatures, SignerInstallMode, SignerMode, SignerOptions, Tweak};
 use serde_json::{Value, json};
 
-use crate::{event, ipa};
+use crate::{direct, event, ipa};
 
 const LABEL: &str = "Sideport";
 
@@ -112,70 +115,249 @@ pub async fn handle(cmd: &str, req: &Value) -> Result<Value> {
         "certificates" => certificates(req).await,
         "revoke_certificate" => revoke_certificate(req).await,
         "install" => install(req).await,
+        "enable_wifi" => enable_wifi(arg(req, "udid")?).await,
+        "forget_pairing" => forget_pairing(arg(req, "udid")?).await,
         _ => bail!("unknown command \"{cmd}\""),
     }
 }
 
 // ---------------------------------------------------------------- devices
 
+/// How the engine reaches a phone: through usbmuxd (USB, or Wi-Fi when macOS sees it), or straight to its IP
+/// with the pairing saved earlier (see direct.rs).
+enum Route {
+    Mux(UsbmuxdDevice),
+    Direct { udid: String, addr: IpAddr, pairing: PairingFile },
+}
+
+impl Route {
+    fn provider(&self) -> Box<dyn IdeviceProvider> {
+        match self {
+            Route::Mux(d) => Box::new(d.to_provider(UsbmuxdAddr::default(), LABEL)),
+            Route::Direct { addr, pairing, .. } => Box::new(direct::provider(*addr, pairing.clone(), LABEL)),
+        }
+    }
+
+    fn udid(&self) -> &str {
+        match self {
+            Route::Mux(d) => &d.udid,
+            Route::Direct { udid, .. } => udid,
+        }
+    }
+
+    /// "usb", "wifi" (through macOS) or "network" (direct).
+    fn connection(&self) -> &'static str {
+        match self {
+            Route::Mux(d) if matches!(d.connection_type, Connection::Usb) => "usb",
+            Route::Mux(_) => "wifi",
+            Route::Direct { .. } => "network",
+        }
+    }
+}
+
 async fn usbmuxd_devices() -> Result<Vec<UsbmuxdDevice>> {
     let mut mux = UsbmuxdConnection::default().await.context("can't reach usbmuxd (the Mac's iPhone service)")?;
     Ok(mux.get_devices().await?)
 }
 
-/// One entry per device; a phone seen over both USB and Wi-Fi is listed once, as USB.
+/// What we've already learned about each phone since the engine started, so the device list (asked for every
+/// few seconds) doesn't redo it.
+#[derive(Default, Clone)]
+struct Known {
+    /// The pairing record was saved this run.
+    saved: bool,
+    /// "Show this iPhone when on Wi-Fi" is on (EnableWifiConnections). Only read over USB.
+    wifi_enabled: Option<bool>,
+}
+
+static KNOWN: OnceLock<Mutex<HashMap<String, Known>>> = OnceLock::new();
+
+fn known() -> &'static Mutex<HashMap<String, Known>> {
+    KNOWN.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Saves what's needed to reach a phone directly later: its pairing record, Wi-Fi MAC address and IP.
+/// Best effort; a failure here only means the direct route won't be available.
+async fn remember(d: &UsbmuxdDevice, values: &plist::Value) {
+    let udid = d.udid.clone();
+    let dict = values.as_dictionary();
+    let text = |k: &str| dict.and_then(|d| d.get(k)).and_then(plist::Value::as_string).map(String::from);
+    let wifi_mac = text("WiFiAddress");
+    let name = text("DeviceName");
+    let ip = match d.connection_type {
+        Connection::Network(ip) => Some(ip),
+        _ => None,
+    };
+    direct::update_meta(&udid, |m| {
+        if wifi_mac.is_some() {
+            m.wifi_mac = wifi_mac;
+        }
+        if ip.is_some() {
+            m.ip = ip;
+        }
+        if name.is_some() {
+            m.name = name;
+        }
+    });
+
+    let state = known().lock().unwrap().get(&udid).cloned().unwrap_or_default();
+    if !state.saved {
+        match save_pairing_from_mux(&udid).await {
+            Ok(()) => known().lock().unwrap().entry(udid.clone()).or_default().saved = true,
+            Err(e) => log::warn!("couldn't save the pairing for {udid}: {e:#}"),
+        }
+    }
+    if state.wifi_enabled.is_none() && matches!(d.connection_type, Connection::Usb) {
+        if let Ok(on) = wifi_connections_enabled(d).await {
+            known().lock().unwrap().entry(udid).or_default().wifi_enabled = Some(on);
+        }
+    }
+}
+
+async fn save_pairing_from_mux(udid: &str) -> Result<()> {
+    let mut mux = UsbmuxdConnection::default().await?;
+    let pairing = mux.get_pair_record(udid).await?;
+    direct::save_pairing(udid, pairing)
+}
+
+/// A lockdown session over usbmuxd, needed to read or change the wireless settings.
+async fn mux_session(d: &UsbmuxdDevice) -> Result<LockdownClient> {
+    let p = d.to_provider(UsbmuxdAddr::default(), LABEL);
+    let mut lockdown = LockdownClient::connect(&p).await?;
+    lockdown.start_session(&p.get_pairing_file().await?).await?;
+    Ok(lockdown)
+}
+
+async fn wifi_connections_enabled(d: &UsbmuxdDevice) -> Result<bool> {
+    let mut lockdown = mux_session(d).await?;
+    let v = lockdown.get_value(Some("EnableWifiConnections"), Some(WIRELESS_DOMAIN)).await?;
+    Ok(v.as_boolean().unwrap_or(false))
+}
+
+const WIRELESS_DOMAIN: &str = "com.apple.mobile.wireless_lockdown";
+
+/// Turns on "Show this iPhone when on Wi-Fi" for a phone plugged in by USB, so it can be used without the cable.
+async fn enable_wifi(udid: &str) -> Result<Value> {
+    let all = usbmuxd_devices().await?;
+    let d = all
+        .iter()
+        .find(|d| d.udid == udid && matches!(d.connection_type, Connection::Usb))
+        .ok_or_else(|| anyhow!("plug the phone in with a cable to turn on Wi-Fi"))?;
+    let mut lockdown = mux_session(d).await?;
+    lockdown.set_value("EnableWifiConnections", plist::Value::Boolean(true), Some(WIRELESS_DOMAIN)).await?;
+    let on = lockdown
+        .get_value(Some("EnableWifiConnections"), Some(WIRELESS_DOMAIN))
+        .await
+        .ok()
+        .and_then(|v| v.as_boolean())
+        .unwrap_or(false);
+    if !on {
+        bail!("the phone didn't turn on Wi-Fi connections");
+    }
+    save_pairing_from_mux(udid).await.context("Wi-Fi is on, but the pairing couldn't be saved")?;
+    let mut k = known().lock().unwrap();
+    let e = k.entry(udid.to_string()).or_default();
+    e.wifi_enabled = Some(true);
+    e.saved = true;
+    Ok(json!({ "wifi_enabled": true }))
+}
+
+async fn forget_pairing(udid: &str) -> Result<Value> {
+    direct::forget(udid)?;
+    known().lock().unwrap().remove(udid);
+    Ok(Value::Null)
+}
+
+fn device_json(udid: &str, values: &plist::Value, connection: &str) -> Value {
+    let dict = values.as_dictionary();
+    let text = |k: &str| dict.and_then(|d| d.get(k)).and_then(plist::Value::as_string).unwrap_or("").to_string();
+    let name = text("DeviceName");
+    let k = known().lock().unwrap().get(udid).cloned().unwrap_or_default();
+    json!({
+        "udid": udid,
+        "name": if name.is_empty() { "iPhone".to_string() } else { name },
+        "model": text("ProductType"),
+        "ios": text("ProductVersion"),
+        "class": text("DeviceClass"),
+        "connection": connection,
+        "wifi_enabled": k.wifi_enabled,
+        "paired": direct::has_pairing(udid),
+    })
+}
+
+/// One entry per device; a phone seen over both USB and Wi-Fi is listed once, as USB. Phones macOS can't see
+/// but that answer at their saved address are listed with connection "network".
 async fn devices() -> Result<Value> {
     let mut by_udid: HashMap<String, Value> = HashMap::new();
-    for d in usbmuxd_devices().await? {
+    let mux = usbmuxd_devices().await;
+    let saved = direct::saved_udids();
+    if let Err(e) = &mux {
+        if saved.is_empty() {
+            bail!("{e:#}");
+        }
+        log::warn!("{e:#}");
+    }
+    for d in mux.unwrap_or_default() {
         let wifi = matches!(d.connection_type, Connection::Network(_));
         if wifi && by_udid.get(&d.udid).is_some_and(|v| v["connection"] == "usb") {
             continue;
         }
-        let info = device_info(&d).await.unwrap_or_default();
-        by_udid.insert(
-            d.udid.clone(),
-            json!({
-                "udid": d.udid,
-                "name": info.get("DeviceName").cloned().unwrap_or_else(|| "iPhone".into()),
-                "model": info.get("ProductType").cloned().unwrap_or_default(),
-                "ios": info.get("ProductVersion").cloned().unwrap_or_default(),
-                "class": info.get("DeviceClass").cloned().unwrap_or_default(),
-                "connection": if wifi { "wifi" } else { "usb" },
-            }),
-        );
+        let route = Route::Mux(d.clone());
+        let values = device_values(&*route.provider()).await.unwrap_or(plist::Value::Dictionary(Default::default()));
+        remember(&d, &values).await;
+        by_udid.insert(d.udid.clone(), device_json(&d.udid, &values, route.connection()));
+    }
+    for udid in saved {
+        if by_udid.contains_key(&udid) {
+            continue;
+        }
+        if let Some((addr, pairing)) = direct::reach(&udid, LABEL, false).await {
+            let route = Route::Direct { udid: udid.clone(), addr, pairing };
+            if let Ok(values) = direct::device_values(&*route.provider()).await {
+                by_udid.insert(udid.clone(), device_json(&udid, &values, route.connection()));
+            }
+        }
     }
     let mut list: Vec<Value> = by_udid.into_values().collect();
     list.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     Ok(json!(list))
 }
 
-async fn device_info(d: &UsbmuxdDevice) -> Result<HashMap<String, String>> {
-    let mut lockdown = LockdownClient::connect(&d.to_provider(UsbmuxdAddr::default(), LABEL)).await?;
-    let values = lockdown.get_value(None, None).await?;
-    let mut out = HashMap::new();
-    if let Some(dict) = values.as_dictionary() {
-        for key in ["DeviceName", "ProductType", "ProductVersion", "DeviceClass"] {
-            if let Some(s) = dict.get(key).and_then(plist::Value::as_string) {
-                out.insert(key.to_string(), s.to_string());
-            }
-        }
-    }
-    Ok(out)
+async fn device_values(p: &dyn IdeviceProvider) -> Result<plist::Value> {
+    let mut lockdown = LockdownClient::connect(p).await?;
+    Ok(lockdown.get_value(None, None).await?)
 }
 
-async fn find_device(udid: &str) -> Result<UsbmuxdDevice> {
-    let all = usbmuxd_devices().await?;
+async fn device_name(p: &dyn IdeviceProvider) -> String {
+    device_values(p)
+        .await
+        .ok()
+        .and_then(|v| v.as_dictionary().and_then(|d| d.get("DeviceName")).and_then(plist::Value::as_string).map(String::from))
+        .unwrap_or_else(|| "iPhone".into())
+}
+
+/// The best way to reach a phone right now: USB, then Wi-Fi through macOS, then directly.
+async fn find_device(udid: &str) -> Result<Route> {
+    let all = usbmuxd_devices().await.unwrap_or_default();
     // Prefer USB: it's faster for big installs.
-    all.iter()
+    if let Some(d) = all
+        .iter()
         .find(|d| d.udid == udid && matches!(d.connection_type, Connection::Usb))
         .or_else(|| all.iter().find(|d| d.udid == udid))
-        .cloned()
-        .ok_or_else(|| anyhow!("the device isn't connected (plug it in, or turn on Wi-Fi syncing in Finder)"))
+    {
+        return Ok(Route::Mux(d.clone()));
+    }
+    if let Some((addr, pairing)) = direct::reach(udid, LABEL, true).await {
+        return Ok(Route::Direct { udid: udid.to_string(), addr, pairing });
+    }
+    Err(anyhow!(
+        "the device isn't connected (plug it in, or make sure it's on the same Wi-Fi with Wi-Fi turned on in Sideport's Devices page)"
+    ))
 }
 
 async fn installed_apps(udid: &str) -> Result<Value> {
     let d = find_device(udid).await?;
-    let mut proxy = InstallationProxyClient::connect(&d.to_provider(UsbmuxdAddr::default(), LABEL)).await?;
+    let mut proxy = InstallationProxyClient::connect(&*d.provider()).await?;
     let apps = proxy.get_apps(Some("User"), None).await?;
     let mut list = Vec::new();
     for (bundle_id, info) in apps {
@@ -194,7 +376,7 @@ async fn installed_apps(udid: &str) -> Result<Value> {
 
 async fn uninstall(udid: &str, bundle_id: &str) -> Result<Value> {
     let d = find_device(udid).await?;
-    let mut proxy = InstallationProxyClient::connect(&d.to_provider(UsbmuxdAddr::default(), LABEL)).await?;
+    let mut proxy = InstallationProxyClient::connect(&*d.provider()).await?;
     proxy.uninstall(bundle_id, None).await?;
     Ok(Value::Null)
 }
@@ -416,9 +598,57 @@ fn features(o: &Value) -> SignerFeatures {
         support_game_mode: f("game_mode"),
         support_pro_motion: f("pro_motion"),
         support_liquid_glass: f("liquid_glass"),
-        support_ellekit: f("ellekit"),
+        // Sideport injects the tweak loader itself (inject_tweaks), so the user can pick which one.
+        support_ellekit: false,
         remove_url_schemes: f("remove_url_schemes"),
     }
+}
+
+/// Injects the tweak loader the user picked, then the tweaks. Impactor would always use ElleKit; doing it here
+/// lets "tweak_framework" choose: "ellekit" (bundled), "substrate" (your own CydiaSubstrate.framework, at
+/// "substrate_path") or "none" (tweaks go in as they are, for ones that bring their own hooking).
+async fn inject_tweaks(bundle: &Bundle, o: &Value) -> Result<()> {
+    let tweaks: Vec<PathBuf> =
+        o.get("tweaks").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(PathBuf::from).collect()).unwrap_or_default();
+    let always_loader = o.get("ellekit").and_then(Value::as_bool).unwrap_or(false);
+    if tweaks.is_empty() && !always_loader {
+        return Ok(());
+    }
+    match opt(o, "tweak_framework").unwrap_or("ellekit") {
+        "ellekit" => Tweak::install_ellekit(bundle).await.context("couldn't add ElleKit")?,
+        "substrate" => {
+            let path = PathBuf::from(
+                opt(o, "substrate_path").ok_or_else(|| anyhow!("choose your CydiaSubstrate.framework under Tweaks, or pick another tweak loader"))?,
+            );
+            if path.file_name().and_then(|n| n.to_str()) != Some("CydiaSubstrate.framework") || !path.join("CydiaSubstrate").is_file() {
+                bail!("{} isn't a CydiaSubstrate.framework", path.display());
+            }
+            // Goes in as Frameworks/CydiaSubstrate.framework, which is where tweaks are pointed to look for it.
+            Tweak::new(&path, bundle).await?.apply().await.context("couldn't add Cydia Substrate")?;
+        }
+        "none" => {}
+        other => bail!("unknown tweak loader \"{other}\""),
+    }
+    for t in &tweaks {
+        Tweak::new(t, bundle).await?.apply().await.with_context(|| format!("couldn't inject {}", t.display()))?;
+    }
+    Ok(())
+}
+
+/// Adds get-task-allow to the app's own executable, so debuggers can attach and emulators can use JIT.
+/// Used for ad-hoc signing only: with an Apple ID, the development profile already grants it. Impactor's ad-hoc
+/// signing keeps the entitlements a binary already has, so signing the executable with them first is enough.
+fn add_get_task_allow(bundle: &Bundle) -> Result<()> {
+    let exe = bundle.get_executable().ok_or_else(|| anyhow!("the app has no executable"))?;
+    let path = bundle.bundle_dir().join(exe);
+    let mut entitlements = plume_core::MachO::new(&path)?.entitlements().clone().unwrap_or_default();
+    entitlements.insert("get-task-allow".into(), plist::Value::Boolean(true));
+    let mut xml = Vec::new();
+    plist::Value::Dictionary(entitlements).to_writer_xml(&mut xml)?;
+    let mut settings = SigningSettings::default();
+    settings.set_entitlements_xml(SettingsScope::Main, String::from_utf8(xml)?)?;
+    UnifiedSigner::new(settings).sign_path_in_place(&path)?;
+    Ok(())
 }
 
 /// Changes Impactor doesn't make itself. Done before App IDs are registered, so removed extensions don't use
@@ -483,7 +713,11 @@ async fn install(req: &Value) -> Result<Value> {
 
     progress(&job, "Opening the IPA", 3);
     let device = match &install_to {
-        Some(udid) => Some(Device::new(find_device(udid).await?).await),
+        Some(udid) => {
+            let route = find_device(udid).await?;
+            let name = device_name(&*route.provider()).await;
+            Some((route, name))
+        }
         None => None,
     };
     let package = {
@@ -502,10 +736,17 @@ async fn install(req: &Value) -> Result<Value> {
         custom_version: opt(&o, "version").map(String::from),
         custom_icon: opt(&o, "icon").map(PathBuf::from),
         features: features(&o),
-        tweaks: o.get("tweaks").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_str).map(PathBuf::from).collect()),
+        // Injected by inject_tweaks instead, with the loader the user chose.
+        tweaks: None,
         install_mode: if install_to.is_some() { SignerInstallMode::Install } else { SignerInstallMode::Export },
         ..Default::default()
     };
+    // "Automatic bundle ID" off: keep the app's own ID instead of adding the team ID to it.
+    let auto_bundle_id = o.get("auto_bundle_id").and_then(Value::as_bool).unwrap_or(true);
+    if !auto_bundle_id && options.custom_identifier.is_none() {
+        options.custom_identifier = bundle.get_bundle_identifier();
+    }
+    let debugging = o.get("debugging").and_then(Value::as_bool).unwrap_or(false);
 
     let mut result = json!({});
     let mut expires: Option<String> = None;
@@ -520,13 +761,14 @@ async fn install(req: &Value) -> Result<Value> {
             progress(&job, "Getting the signing certificate", 22);
             let (identity, which) = identity(&job, email, &session, &team, req).await?;
             certificate = which;
-            if let Some(d) = &device {
+            if let Some((route, name)) = &device {
                 progress(&job, "Registering the device", 30);
-                session.qh_ensure_device(&team, &d.name, &d.udid).await?;
+                session.qh_ensure_device(&team, name, &route.udid().to_string()).await?;
             }
             let mut signer = Signer::new(Some(identity), options);
             progress(&job, "Customising the app", 36);
             signer.modify_bundle(&bundle, &Some(team.clone())).await?;
+            inject_tweaks(&bundle, &o).await?;
             extra_changes(bundle.bundle_dir(), &o)?;
             progress(&job, "Registering App IDs", 44);
             signer.register_bundle(&bundle, &session, &team, false).await?;
@@ -545,8 +787,11 @@ async fn install(req: &Value) -> Result<Value> {
             if let Some(p) = opt(req, "profile") {
                 signer.provisioning_files.push(plume_core::MobileProvision::load_with_path(&PathBuf::from(p))?);
             }
+            // Debugging comes from the profile here (development profiles allow it), since the entitlements have to
+            // match it; "debugging" is only acted on for ad-hoc signing.
             progress(&job, "Customising the app", 36);
             signer.modify_bundle(&bundle, &None).await?;
+            inject_tweaks(&bundle, &o).await?;
             extra_changes(bundle.bundle_dir(), &o)?;
             progress(&job, "Signing", 55);
             signer.sign_bundle(&bundle).await?;
@@ -557,20 +802,30 @@ async fn install(req: &Value) -> Result<Value> {
             options.mode = SignerMode::Adhoc;
             let mut signer = Signer::new(None, options);
             signer.modify_bundle(&bundle, &None).await?;
+            inject_tweaks(&bundle, &o).await?;
             extra_changes(bundle.bundle_dir(), &o)?;
+            if debugging {
+                add_get_task_allow(&bundle).context("couldn't turn on debugging")?;
+            }
             progress(&job, "Signing", 55);
             signer.sign_bundle(&bundle).await?;
         }
         other => bail!("unknown signing mode \"{other}\""),
     }
 
-    if let Some(d) = &device {
-        progress(&job, "Sending to the device", 60);
+    if let Some((route, _)) = &device {
+        progress(&job, if route.connection() == "usb" { "Sending to the device" } else { "Sending to the device over Wi-Fi" }, 60);
         let job2 = job.clone();
-        d.install_app(bundle.bundle_dir(), move |p: i32| {
-            let job = job2.clone();
-            async move { progress(&job, "Installing", 60 + p * 38 / 100) }
-        })
+        idevice::utils::installation::install_package_with_callback(
+            &*route.provider(),
+            bundle.bundle_dir(),
+            None,
+            move |(p, _): (u64, ())| {
+                let job = job2.clone();
+                async move { progress(&job, "Installing", 60 + p as i32 * 38 / 100) }
+            },
+            (),
+        )
         .await
         .map_err(|e| anyhow!("install failed: {e}"))?;
     }

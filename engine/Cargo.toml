@@ -10,9 +10,9 @@ name = "sideport-engine"
 path = "src/main.rs"
 
 [dependencies]
-plume_core = { git = "https://github.com/claration/Impactor", rev = "b13d99559febd63e3710dfdd0ef8cdd78d10ae13" }
-plume_utils = { git = "https://github.com/claration/Impactor", rev = "b13d99559febd63e3710dfdd0ef8cdd78d10ae13" }
-plume_store = { git = "https://github.com/claration/Impactor", rev = "b13d99559febd63e3710dfdd0ef8cdd78d10ae13" }
+plume_core = { git = "https://github.com/claration/Impactor", rev = "2ba32ea43246bd4db0265eb3120d3c72e39f5b22" }
+plume_utils = { git = "https://github.com/claration/Impactor", rev = "2ba32ea43246bd4db0265eb3120d3c72e39f5b22" }
+plume_store = { git = "https://github.com/claration/Impactor", rev = "2ba32ea43246bd4db0265eb3120d3c72e39f5b22" }
 idevice = { git = "https://github.com/jkcoxson/idevice", rev = "5171e34e3a236842af1160a84d955d037ddca3af", default-features = false, features = ["full", "ring"] }
 tokio = { version = "1.43", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "fs", "time", "net"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
@@ -30,7 +30,7 @@ mdns-sd = "0.22.0"
 
 # Impactor patches apple-codesign; use its copy too.
 [patch.crates-io]
-apple-codesign = { git = "https://github.com/claration/Impactor", rev = "b13d99559febd63e3710dfdd0ef8cdd78d10ae13" }
+apple-codesign = { git = "https://github.com/claration/Impactor", rev = "2ba32ea43246bd4db0265eb3120d3c72e39f5b22" }
 
 [profile.release]
 opt-level = 3

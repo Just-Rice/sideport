@@ -182,7 +182,7 @@ dependencies = [
 [[package]]
 name = "apple-codesign"
 version = "0.29.0"
-source = "git+https://github.com/claration/Impactor?rev=b13d99559febd63e3710dfdd0ef8cdd78d10ae13#b13d99559febd63e3710dfdd0ef8cdd78d10ae13"
+source = "git+https://github.com/claration/Impactor?rev=2ba32ea43246bd4db0265eb3120d3c72e39f5b22#2ba32ea43246bd4db0265eb3120d3c72e39f5b22"
 dependencies = [
  "anyhow",
  "apple-bundles",
@@ -1226,8 +1226,8 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "decompress"
-version = "2.7.2"
-source = "git+https://github.com/claration/Impactor?rev=b13d99559febd63e3710dfdd0ef8cdd78d10ae13#b13d99559febd63e3710dfdd0ef8cdd78d10ae13"
+version = "2.7.3"
+source = "git+https://github.com/claration/Impactor?rev=2ba32ea43246bd4db0265eb3120d3c72e39f5b22#2ba32ea43246bd4db0265eb3120d3c72e39f5b22"
 dependencies = [
  "ar",
  "bzip2 0.6.1",
@@ -2996,8 +2996,8 @@ dependencies = [
 
 [[package]]
 name = "omnisette"
-version = "2.7.2"
-source = "git+https://github.com/claration/Impactor?rev=b13d99559febd63e3710dfdd0ef8cdd78d10ae13#b13d99559febd63e3710dfdd0ef8cdd78d10ae13"
+version = "2.7.3"
+source = "git+https://github.com/claration/Impactor?rev=2ba32ea43246bd4db0265eb3120d3c72e39f5b22#2ba32ea43246bd4db0265eb3120d3c72e39f5b22"
 dependencies = [
  "android-loader",
  "anyhow",
@@ -3363,8 +3363,8 @@ dependencies = [
 
 [[package]]
 name = "plume_core"
-version = "2.7.2"
-source = "git+https://github.com/claration/Impactor?rev=b13d99559febd63e3710dfdd0ef8cdd78d10ae13#b13d99559febd63e3710dfdd0ef8cdd78d10ae13"
+version = "2.7.3"
+source = "git+https://github.com/claration/Impactor?rev=2ba32ea43246bd4db0265eb3120d3c72e39f5b22#2ba32ea43246bd4db0265eb3120d3c72e39f5b22"
 dependencies = [
  "aes 0.9.4",
  "aes-gcm",
@@ -3400,8 +3400,8 @@ dependencies = [
 
 [[package]]
 name = "plume_store"
-version = "2.7.2"
-source = "git+https://github.com/claration/Impactor?rev=b13d99559febd63e3710dfdd0ef8cdd78d10ae13#b13d99559febd63e3710dfdd0ef8cdd78d10ae13"
+version = "2.7.3"
+source = "git+https://github.com/claration/Impactor?rev=2ba32ea43246bd4db0265eb3120d3c72e39f5b22#2ba32ea43246bd4db0265eb3120d3c72e39f5b22"
 dependencies = [
  "chrono",
  "plume_core",
@@ -3412,8 +3412,8 @@ dependencies = [
 
 [[package]]
 name = "plume_utils"
-version = "2.7.2"
-source = "git+https://github.com/claration/Impactor?rev=b13d99559febd63e3710dfdd0ef8cdd78d10ae13#b13d99559febd63e3710dfdd0ef8cdd78d10ae13"
+version = "2.7.3"
+source = "git+https://github.com/claration/Impactor?rev=2ba32ea43246bd4db0265eb3120d3c72e39f5b22#2ba32ea43246bd4db0265eb3120d3c72e39f5b22"
 dependencies = [
  "decompress",
  "flate2",

@@ -5,11 +5,11 @@
 // tapped Trust) and its Wi-Fi details. Later, if usbmuxd can't find it, we connect to the phone's lockdown port
 // ourselves with that pairing, the same way usbmuxd would.
 //
-// Saved in <data>/pairings: <udid>.plist (the pairing record, readable only by you) and <udid>.json (last IP and
-// Wi-Fi MAC address, used to find the phone again with Bonjour when its IP changes).
+// Saved in <data>/pairings: <udid>.plist (the pairing record, readable only by you) and <udid>.json (last IP).
+// When the IP changes, the phone is found again with Bonjour.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -26,8 +26,7 @@ use crate::ops::data_dir;
 
 // lockdownd (port 62078) listens on Wi-Fi once "Show this iPhone when on Wi-Fi" (EnableWifiConnections) is on.
 
-/// Bonjour service a phone with Wi-Fi connections turned on advertises. Its instance name starts with the
-/// phone's Wi-Fi MAC address ("aa:bb:cc:dd:ee:ff@fe80::...").
+/// Bonjour service a phone with Wi-Fi connections turned on advertises.
 const BONJOUR_SERVICE: &str = "_apple-mobdev2._tcp.local.";
 /// How long to wait for a phone before deciding it isn't on the network.
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -39,8 +38,6 @@ const BONJOUR_RETRY_AFTER: Duration = Duration::from_secs(60);
 pub struct Meta {
     /// Last IP address the phone was reached at.
     pub ip: Option<IpAddr>,
-    /// The phone's Wi-Fi MAC address (lockdown's WiFiAddress), to recognise it in Bonjour.
-    pub wifi_mac: Option<String>,
     pub name: Option<String>,
 }
 
@@ -180,7 +177,7 @@ pub async fn reach(udid: &str, label: &str, eager: bool) -> Option<(IpAddr, Pair
         }
     }
     let meta = load_meta(udid);
-    if let Some(ip) = meta.ip {
+    if let Some(ip) = meta.ip.filter(usable) {
         match check(ip, &pairing, label).await {
             Ok(()) => {
                 attempts().lock().unwrap().remove(udid);
@@ -189,50 +186,45 @@ pub async fn reach(udid: &str, label: &str, eager: bool) -> Option<(IpAddr, Pair
             Err(e) => log::debug!("{udid} not at {ip}: {e:#}"),
         }
     }
-    // The IP may have changed. Look for the phone's Wi-Fi address in Bonjour, at most once a minute.
-    let found = match &meta.wifi_mac {
-        Some(mac) => {
-            let due = {
-                let mut a = attempts().lock().unwrap();
-                let entry = a.entry(udid.to_string()).or_default();
-                let due = eager || entry.bonjour_at.is_none_or(|t| t.elapsed() >= BONJOUR_RETRY_AFTER);
-                if due {
-                    entry.bonjour_at = Some(Instant::now());
-                }
-                due
-            };
-            if due { bonjour_lookup(mac).await } else { None }
+    // The IP may have changed. Ask Bonjour for every phone with Wi-Fi connections on, at most once a minute,
+    // and keep the one that accepts this phone's pairing. (Bonjour names phones by their private Wi-Fi
+    // address, which iOS changes per network, so the name can't be matched to a phone.)
+    let due = {
+        let mut a = attempts().lock().unwrap();
+        let entry = a.entry(udid.to_string()).or_default();
+        let due = eager || entry.bonjour_at.is_none_or(|t| t.elapsed() >= BONJOUR_RETRY_AFTER);
+        if due {
+            entry.bonjour_at = Some(Instant::now());
         }
-        None => None,
+        due
     };
-    if let Some(ip) = found.filter(|ip| Some(*ip) != meta.ip) {
-        if check(ip, &pairing, label).await.is_ok() {
-            log::info!("found {udid} at {ip} with Bonjour");
-            update_meta(udid, |m| m.ip = Some(ip));
-            attempts().lock().unwrap().remove(udid);
-            return Some((ip, pairing));
+    if due {
+        for ip in bonjour_phones().await.into_iter().filter(|ip| Some(*ip) != meta.ip) {
+            if check(ip, &pairing, label).await.is_ok() {
+                log::info!("found {udid} at {ip} with Bonjour");
+                update_meta(udid, |m| m.ip = Some(ip));
+                attempts().lock().unwrap().remove(udid);
+                return Some((ip, pairing));
+            }
         }
     }
     attempts().lock().unwrap().entry(udid.to_string()).or_default().failed_at = Some(Instant::now());
     None
 }
 
-/// Looks for a phone with this Wi-Fi MAC address on the local network. Takes up to 3 seconds.
-async fn bonjour_lookup(mac: &str) -> Option<IpAddr> {
-    let mac = mac.to_lowercase();
+/// IPv4 addresses of every phone on the local network advertising Wi-Fi connections. Takes about 3 seconds.
+async fn bonjour_phones() -> Vec<IpAddr> {
     tokio::task::spawn_blocking(move || {
-        let daemon = mdns_sd::ServiceDaemon::new().ok()?;
-        let rx = daemon.browse(BONJOUR_SERVICE).ok()?;
+        let Ok(daemon) = mdns_sd::ServiceDaemon::new() else { return vec![] };
+        let Ok(rx) = daemon.browse(BONJOUR_SERVICE) else { return vec![] };
         let deadline = Instant::now() + Duration::from_secs(3);
-        let mut found = None;
+        let mut found: Vec<IpAddr> = Vec::new();
         while let Ok(event) = rx.recv_deadline(deadline) {
             if let mdns_sd::ServiceEvent::ServiceResolved(info) = event {
-                let instance = info.get_fullname().to_lowercase();
-                if instance.starts_with(&format!("{mac}@")) {
-                    let v4: Vec<Ipv4Addr> = info.get_addresses_v4().into_iter().filter(|a| !a.is_link_local()).collect();
-                    if let Some(a) = v4.first() {
-                        found = Some(IpAddr::V4(*a));
-                        break;
+                for a in info.get_addresses_v4() {
+                    let ip = IpAddr::V4(a);
+                    if usable(&ip) && !found.contains(&ip) {
+                        found.push(ip);
                     }
                 }
             }
@@ -242,8 +234,16 @@ async fn bonjour_lookup(mac: &str) -> Option<IpAddr> {
         found
     })
     .await
-    .ok()
-    .flatten()
+    .unwrap_or_default()
+}
+
+/// Whether an address can be connected to without knowing which network interface it's on. IPv6 link-local
+/// addresses (fe80::) can't, and 169.254 ones are usually a USB or peer-to-peer link rather than the Wi-Fi.
+pub fn usable(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => !v4.is_link_local() && !v4.is_loopback(),
+        IpAddr::V6(v6) => !v6.is_loopback() && (v6.segments()[0] & 0xffc0) != 0xfe80,
+    }
 }
 
 /// The phone's basic details over a direct connection (no session needed), for the device list.

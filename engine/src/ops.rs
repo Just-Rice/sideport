@@ -156,6 +156,10 @@ impl Route {
 }
 
 async fn usbmuxd_devices() -> Result<Vec<UsbmuxdDevice>> {
+    // For testing the direct Wi-Fi route: pretend macOS can't see any phones.
+    if std::env::var_os("SIDEPORT_NO_USBMUXD").is_some() {
+        bail!("usbmuxd ignored (SIDEPORT_NO_USBMUXD is set)");
+    }
     let mut mux = UsbmuxdConnection::default().await.context("can't reach usbmuxd (the Mac's iPhone service)")?;
     Ok(mux.get_devices().await?)
 }
@@ -176,22 +180,18 @@ fn known() -> &'static Mutex<HashMap<String, Known>> {
     KNOWN.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Saves what's needed to reach a phone directly later: its pairing record, Wi-Fi MAC address and IP.
+/// Saves what's needed to reach a phone directly later: its pairing record and IP.
 /// Best effort; a failure here only means the direct route won't be available.
 async fn remember(d: &UsbmuxdDevice, values: &plist::Value) {
     let udid = d.udid.clone();
     let dict = values.as_dictionary();
     let text = |k: &str| dict.and_then(|d| d.get(k)).and_then(plist::Value::as_string).map(String::from);
-    let wifi_mac = text("WiFiAddress");
     let name = text("DeviceName");
     let ip = match d.connection_type {
-        Connection::Network(ip) => Some(ip),
+        Connection::Network(ip) if direct::usable(&ip) => Some(ip),
         _ => None,
     };
     direct::update_meta(&udid, |m| {
-        if wifi_mac.is_some() {
-            m.wifi_mac = wifi_mac;
-        }
         if ip.is_some() {
             m.ip = ip;
         }
@@ -208,8 +208,9 @@ async fn remember(d: &UsbmuxdDevice, values: &plist::Value) {
         }
     }
     if state.wifi_enabled.is_none() && matches!(d.connection_type, Connection::Usb) {
-        if let Ok(on) = wifi_connections_enabled(d).await {
-            known().lock().unwrap().entry(udid).or_default().wifi_enabled = Some(on);
+        match wifi_connections_enabled(d).await {
+            Ok(on) => known().lock().unwrap().entry(udid).or_default().wifi_enabled = Some(on),
+            Err(e) => log::warn!("couldn't read {udid}'s Wi-Fi setting: {e:#}"),
         }
     }
 }
@@ -230,8 +231,12 @@ async fn mux_session(d: &UsbmuxdDevice) -> Result<LockdownClient> {
 
 async fn wifi_connections_enabled(d: &UsbmuxdDevice) -> Result<bool> {
     let mut lockdown = mux_session(d).await?;
-    let v = lockdown.get_value(Some("EnableWifiConnections"), Some(WIRELESS_DOMAIN)).await?;
-    Ok(v.as_boolean().unwrap_or(false))
+    match lockdown.get_value(Some("EnableWifiConnections"), Some(WIRELESS_DOMAIN)).await {
+        Ok(v) => Ok(v.as_boolean().unwrap_or(false)),
+        // A phone that's never had Wi-Fi connections turned on doesn't have the key at all.
+        Err(e) if e.to_string().contains("MissingValue") => Ok(false),
+        Err(e) => Err(e.into()),
+    }
 }
 
 const WIRELESS_DOMAIN: &str = "com.apple.mobile.wireless_lockdown";

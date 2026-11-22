@@ -212,12 +212,13 @@ pub async fn reach(udid: &str, label: &str, eager: bool) -> Option<(IpAddr, Pair
     None
 }
 
-/// IPv4 addresses of every phone on the local network advertising Wi-Fi connections. Takes about 3 seconds.
+/// IPv4 addresses of phones on the local network advertising Wi-Fi connections. Waits up to 6 seconds (phones can
+/// be slow to answer), but stops half a second after the first one does.
 async fn bonjour_phones() -> Vec<IpAddr> {
     tokio::task::spawn_blocking(move || {
         let Ok(daemon) = mdns_sd::ServiceDaemon::new() else { return vec![] };
         let Ok(rx) = daemon.browse(BONJOUR_SERVICE) else { return vec![] };
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut deadline = Instant::now() + Duration::from_secs(6);
         let mut found: Vec<IpAddr> = Vec::new();
         while let Ok(event) = rx.recv_deadline(deadline) {
             if let mdns_sd::ServiceEvent::ServiceResolved(info) = event {
@@ -226,6 +227,9 @@ async fn bonjour_phones() -> Vec<IpAddr> {
                     if usable(&ip) && !found.contains(&ip) {
                         found.push(ip);
                     }
+                }
+                if !found.is_empty() {
+                    deadline = deadline.min(Instant::now() + Duration::from_millis(500));
                 }
             }
         }
